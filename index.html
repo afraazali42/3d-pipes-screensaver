@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Pipes Screensaver</title>
+<style>
+  * { margin: 0; padding: 0; }
+  body { overflow: hidden; background: #000; cursor: none; }
+  canvas { display: block; }
+  #controls {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 12px;
+    opacity: 0;
+    transition: opacity 0.3s;
+    z-index: 10;
+    cursor: default;
+  }
+  body:hover #controls { opacity: 1; cursor: default; }
+  #fadeOverlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: #000;
+    opacity: 0;
+    pointer-events: none;
+    z-index: 5;
+    transition: opacity 0.1s linear;
+  }
+  #controls button {
+    background: rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,0.25);
+    color: #fff;
+    padding: 8px 14px;
+    border-radius: 6px;
+    font-family: system-ui, sans-serif;
+    font-size: 13px;
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+  }
+  #controls button:hover { background: rgba(255,255,255,0.2); }
+</style>
+</head>
+<body>
+
+<div id="fadeOverlay"></div>
+<div id="controls">
+  <button id="resetBtn">Reset</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// --- Config ---
+const PIPE_RADIUS = 0.19;
+const BEND_RADIUS = 0.22;
+const MAX_SEGMENTS_TOTAL = 1000;
+const MAX_PIPE_LENGTH = 800;
+const MIN_PIPE_LENGTH = 250;
+const GROW_INTERVAL = 36; // one segment every 36ms (was Normal+5)
+const CAMERA_DIST = 26;
+const FOV = 72;
+
+// Frustum-aware grid: calculate visible area at grid depth range, then size grid to fit ~85%
+// This adapts to any aspect ratio so pipes mostly stay on screen.
+function calculateGridDimensions() {
+  const aspect = window.innerWidth / window.innerHeight;
+  const halfFovRad = (FOV / 2) * Math.PI / 180;
+
+  // The grid extends from z = -depthHalf to z = +depthHalf, camera is at z = CAMERA_DIST
+  // We want the grid to fill ~85% of the view at the CENTER of the grid (z=0, distance=CAMERA_DIST)
+  const visibleHeightAtCenter = 2 * CAMERA_DIST * Math.tan(halfFovRad);
+  const visibleWidthAtCenter = visibleHeightAtCenter * aspect;
+
+  // Size grid to 85% of visible area at center distance
+  const gridW = Math.floor(visibleWidthAtCenter * 0.85);
+  const gridH = Math.floor(visibleHeightAtCenter * 0.85);
+  // Depth slightly larger than width/height for some depth variety without tiny distant pipes
+  const gridD = Math.floor(Math.max(gridW, gridH) * 1.1);
+
+  return {
+    GRID_W: Math.max(gridW, 8),  // minimum 8 to avoid tiny grids
+    GRID_H: Math.max(gridH, 8),
+    GRID_D: Math.max(gridD, 12),
+  };
+}
+
+let { GRID_W, GRID_H, GRID_D } = calculateGridDimensions();
+let GRID_W_HALF = Math.floor(GRID_W / 2);
+let GRID_H_HALF = Math.floor(GRID_H / 2);
+let GRID_D_HALF = Math.floor(GRID_D / 2);
+
+const DIRECTIONS = [
+  new THREE.Vector3(1, 0, 0),
+  new THREE.Vector3(-1, 0, 0),
+  new THREE.Vector3(0, 1, 0),
+  new THREE.Vector3(0, -1, 0),
+  new THREE.Vector3(0, 0, 1),
+  new THREE.Vector3(0, 0, -1),
+];
+
+const COLORS = [0xff0000, 0x00ff00, 0x4040ff, 0xffff00, 0xff00ff, 0x00ffff, 0xffffff, 0xff8800];
+
+// --- Scene ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+
+const camera = new THREE.PerspectiveCamera(FOV, window.innerWidth / window.innerHeight, 0.1, 1000);
+const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+const renderer = new THREE.WebGLRenderer({ antialias: !isMobile });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(isMobile ? 1 : Math.min(window.devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+const fadeOverlay = document.getElementById('fadeOverlay');
+
+// --- Lighting: bright ambient so shadow side isn't too dark, strong directional for gradient ---
+const ambient = new THREE.AmbientLight(0x606060);
+scene.add(ambient);
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.1);
+dirLight.position.set(0.2, 1, 0.8).normalize();
+scene.add(dirLight);
+// Secondary fill from below-right for subtle depth
+const fillLight = new THREE.DirectionalLight(0xffffff, 0.35);
+fillLight.position.set(0.5, -0.3, 0.5).normalize();
+scene.add(fillLight);
+
+// Shared geometries
+const RADIAL_SEGS = 12;
+const _yAxis = new THREE.Vector3(0, 1, 0);
+const elbowGeom = new THREE.TorusGeometry(BEND_RADIUS, PIPE_RADIUS, RADIAL_SEGS, 12, Math.PI / 2);
+const ballGeom = new THREE.SphereGeometry(PIPE_RADIUS * 1.35, RADIAL_SEGS, RADIAL_SEGS);
+// Hemisphere cap: same radius as pipe, rounded end
+const hemisphereGeom = new THREE.SphereGeometry(PIPE_RADIUS, RADIAL_SEGS, 8, 0, Math.PI * 2, 0, Math.PI / 2);
+
+// --- Grid occupancy ---
+let occupied = new Set();
+function gridKey(x, y, z) { return `${Math.round(x)},${Math.round(y)},${Math.round(z)}`; }
+function isOccupied(pos) { return occupied.has(gridKey(pos.x, pos.y, pos.z)); }
+function markOccupied(pos) { occupied.add(gridKey(pos.x, pos.y, pos.z)); }
+function inBounds(pos) {
+  return Math.abs(pos.x) <= GRID_W_HALF && Math.abs(pos.y) <= GRID_H_HALF && Math.abs(pos.z) <= GRID_D_HALF;
+}
+
+// --- Pipe state ---
+let pipes = [];
+let totalSegments = 0;
+let pipeGroup = new THREE.Group();
+scene.add(pipeGroup);
+let dissolving = false;
+let dissolveStart = 0;
+const DISSOLVE_DURATION = 2000; // fade out over 2s
+const PAUSE_AFTER_DISSOLVE = 800; // black screen pause before new pipes start
+
+function makeMaterial(color) {
+  return new THREE.MeshPhongMaterial({ color, specular: 0x777777, shininess: 30 });
+}
+
+function randomColor() {
+  return COLORS[Math.floor(Math.random() * COLORS.length)];
+}
+
+function randomStartPos() {
+  const rX = () => Math.floor(Math.random() * GRID_W) - GRID_W_HALF;
+  const rY = () => Math.floor(Math.random() * GRID_H) - GRID_H_HALF;
+  const rZ = () => Math.floor(Math.random() * GRID_D) - GRID_D_HALF;
+  let pos, tries = 0;
+  do { pos = new THREE.Vector3(rX(), rY(), rZ()); tries++; }
+  while (isOccupied(pos) && tries < 200);
+  return pos;
+}
+
+// Spawn near an existing pipe's path (for subsequent pipes to create interaction)
+function spawnNearExisting() {
+  const existingPipes = pipes.filter(p => p.gridPoints.length > 5);
+  if (existingPipes.length === 0) return randomStartPos();
+
+  const srcPipe = existingPipes[Math.floor(Math.random() * existingPipes.length)];
+  const srcPoint = srcPipe.gridPoints[Math.floor(Math.random() * srcPipe.gridPoints.length)];
+
+  // Try positions within 3-6 units of the source point
+  for (let tries = 0; tries < 100; tries++) {
+    const offset = new THREE.Vector3(
+      Math.floor(Math.random() * 7) - 3,
+      Math.floor(Math.random() * 7) - 3,
+      Math.floor(Math.random() * 7) - 3
+    );
+    const pos = srcPoint.clone().add(offset);
+    pos.x = Math.round(pos.x); pos.y = Math.round(pos.y); pos.z = Math.round(pos.z);
+    if (inBounds(pos) && !isOccupied(pos)) return pos;
+  }
+  return randomStartPos();
+}
+
+// Reusable scratch vectors to avoid allocations in hot paths
+const _scratchVec = new THREE.Vector3();
+const _scratchVec2 = new THREE.Vector3();
+
+function getValidDirections(pos, lastDir) {
+  return DIRECTIONS.filter(d => {
+    if (lastDir && d.x === -lastDir.x && d.y === -lastDir.y && d.z === -lastDir.z) return false;
+    _scratchVec.copy(pos).add(d);
+    return inBounds(_scratchVec) && !isOccupied(_scratchVec);
+  });
+}
+
+// Every pipe uses a dynamic phase system.
+// Each pipe picks a random straight bias for the current "phase" and a random duration.
+// When the phase expires, it picks a completely new random bias and duration.
+// This creates unpredictable variety — long straight runs, sudden bursts of turns,
+// medium wandering, all within a single pipe's lifetime.
+
+function newPhase() {
+  const roll = Math.random();
+  let bias, zPreference = 0;
+
+  if (roll < 0.40) {
+    // Long straight run (most common)
+    bias = 0.85 + Math.random() * 0.1; // 0.85-0.95
+  } else if (roll < 0.60) {
+    // Medium - some turns
+    bias = 0.55 + Math.random() * 0.2; // 0.55-0.75
+  } else if (roll < 0.75) {
+    // Turny burst
+    bias = 0.2 + Math.random() * 0.2; // 0.2-0.4
+  } else if (roll < 0.85) {
+    // Wild - lots of turns
+    bias = 0.05 + Math.random() * 0.15; // 0.05-0.2
+  } else {
+    // Depth diver — prefers Z-axis movement (toward/away from camera)
+    // Creates pipes that dramatically change size as they move through depth
+    bias = 0.7 + Math.random() * 0.2; // 0.7-0.9 (fairly straight)
+    zPreference = 0.7; // strong preference for Z directions
+  }
+
+  const duration = 3 + Math.floor(Math.random() * 25); // 3-27 steps
+  return { bias, duration, steps: 0, zPreference };
+}
+
+// Frustum check — cached per frame to avoid redundant matrix math across grow steps
+const _frustum = new THREE.Frustum();
+const _projScreenMatrix = new THREE.Matrix4();
+let _frustumFrame = -1;
+
+function updateFrustumCache(frame) {
+  if (_frustumFrame !== frame) {
+    _projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    _frustum.setFromProjectionMatrix(_projScreenMatrix);
+    _frustumFrame = frame;
+  }
+}
+
+function getOffScreenAmount(pos) {
+  if (_frustum.containsPoint(pos)) return 0;
+  _scratchVec2.copy(pos).project(camera);
+  const offX = Math.max(0, Math.abs(_scratchVec2.x) - 1);
+  const offY = Math.max(0, Math.abs(_scratchVec2.y) - 1);
+  return Math.max(offX, offY);
+}
+
+function chooseDirection(pipe, validDirs) {
+  // Initialize phase if needed
+  if (!pipe.phase) pipe.phase = newPhase();
+  pipe.phase.steps++;
+
+  // Check if phase expired — switch to a new random phase
+  if (pipe.phase.steps >= pipe.phase.duration) {
+    pipe.phase = newPhase();
+  }
+
+  const pos = pipe.gridPoints[pipe.gridPoints.length - 1];
+  const offScreen = getOffScreenAmount(pos);
+
+  // If significantly off-screen, bias directions back toward center of view
+  if (offScreen > 0.3) {
+    _scratchVec.set(0, 0, 0).sub(pos).normalize();
+    let bestDir = validDirs[0], bestScore = -Infinity;
+    for (const d of validDirs) {
+      const score = _scratchVec.dot(d) * 2 + Math.random() * 0.5;
+      if (score > bestScore) { bestScore = score; bestDir = d; }
+    }
+    return bestDir;
+  }
+
+  const straightBias = pipe.phase.bias;
+
+  // Try to continue straight
+  if (pipe.dir && validDirs.some(d => d.x === pipe.dir.x && d.y === pipe.dir.y && d.z === pipe.dir.z) && Math.random() < straightBias) {
+    return pipe.dir;
+  }
+
+  // Depth diver: prefer Z-axis directions when turning
+  const zPref = pipe.phase.zPreference || 0;
+  if (zPref > 0 && Math.random() < zPref) {
+    const zDirs = validDirs.filter(d => Math.abs(d.z) > 0);
+    if (zDirs.length > 0) return zDirs[Math.floor(Math.random() * zDirs.length)];
+  }
+
+  return validDirs[Math.floor(Math.random() * validDirs.length)];
+}
+
+// Cylinder geometry pool — most cylinders are one of a few common lengths
+const _cylCache = new Map();
+function getCylinderGeom(length) {
+  // Round to 2 decimal places to maximize cache hits
+  const key = Math.round(length * 100);
+  let geom = _cylCache.get(key);
+  if (!geom) {
+    geom = new THREE.CylinderGeometry(PIPE_RADIUS, PIPE_RADIUS, length, RADIAL_SEGS, 1, false);
+    _cylCache.set(key, geom);
+  }
+  return geom;
+}
+
+// Helper: build a single segment's meshes and add to group
+function buildSegmentMeshes(gp, i, mat, group) {
+  const from = gp[i];
+  const to = gp[i + 1];
+  _scratchVec.copy(to).sub(from).normalize();
+  const dir = _scratchVec.clone(); // need a stable copy for quaternion
+  const segLen = from.distanceTo(to);
+  const BR = BEND_RADIUS;
+
+  let isCornerStart = false, isCornerEnd = false;
+  if (i > 0) {
+    _scratchVec2.copy(from).sub(gp[i - 1]).normalize();
+    if (!_scratchVec2.equals(dir)) isCornerStart = true;
+  }
+  if (i < gp.length - 2) {
+    _scratchVec2.copy(gp[i + 2]).sub(to).normalize();
+    if (!_scratchVec2.equals(dir)) isCornerEnd = true;
+  }
+
+  // Extend cylinder slightly into elbow (overlap of 0.03) to eliminate seam gaps
+  // The torus has open ends, so without overlap there are tiny triangular holes
+  const SEAM_OVERLAP = 0.03;
+  const trimStart = isCornerStart ? (BR - SEAM_OVERLAP) : 0;
+  const trimEnd = isCornerEnd ? (BR - SEAM_OVERLAP) : 0;
+  const meshes = [];
+
+  // Straight cylinder (pooled geometry)
+  const cylLen = segLen - trimStart - trimEnd;
+  if (cylLen > 0.001) {
+    const cyl = new THREE.Mesh(getCylinderGeom(cylLen), mat);
+    const mid = from.clone().add(dir.clone().multiplyScalar(trimStart + cylLen / 2));
+    cyl.position.copy(mid);
+    cyl.quaternion.setFromUnitVectors(_yAxis, dir);
+    group.add(cyl);
+    meshes.push(cyl);
+  }
+
+  // Ball joint at the start of the pipe
+  if (i === 0) {
+    const ball = new THREE.Mesh(ballGeom, mat);
+    ball.position.copy(from);
+    group.add(ball);
+    meshes.push(ball);
+  }
+
+  // Tip hemisphere
+  if (i === gp.length - 2) {
+    const hemi = new THREE.Mesh(hemisphereGeom, mat);
+    hemi.position.copy(to);
+    hemi.quaternion.setFromUnitVectors(_yAxis, dir);
+    hemi._isTip = true;
+    group.add(hemi);
+    meshes.push(hemi);
+  }
+
+  // Elbow at corner
+  if (isCornerEnd && i < gp.length - 2) {
+    const dirIn = dir;
+    const dirOut = gp[i + 2].clone().sub(to).normalize();
+    const elbow = new THREE.Mesh(elbowGeom, mat);
+    const center = to.clone().sub(dirIn.clone().multiplyScalar(BR)).add(dirOut.clone().multiplyScalar(BR));
+    elbow.position.copy(center);
+    const xAxis = dirOut.clone().negate();
+    const yAxisV = dirIn.clone();
+    const zAxis = new THREE.Vector3().crossVectors(xAxis, yAxisV);
+    const m4 = new THREE.Matrix4().makeBasis(xAxis, yAxisV, zAxis);
+    elbow.quaternion.setFromRotationMatrix(m4);
+    group.add(elbow);
+    meshes.push(elbow);
+  }
+
+  return meshes;
+}
+
+// Initial full build (only called once when pipe gets its 2nd point)
+function rebuildPipeMesh(pipe) {
+  if (pipe.mesh) {
+    pipeGroup.remove(pipe.mesh);
+    pipe.mesh.traverse(c => {
+      if (c !== pipe.mesh && c.geometry && c.geometry !== elbowGeom && c.geometry !== ballGeom && c.geometry !== hemisphereGeom) c.geometry.dispose();
+    });
+  }
+
+  const gp = pipe.gridPoints;
+  if (gp.length < 2) return;
+
+  const group = new THREE.Group();
+  group._pipe = pipe;
+  const mat = pipe.material;
+
+  for (let i = 0; i < gp.length - 1; i++) {
+    buildSegmentMeshes(gp, i, mat, group);
+  }
+
+  pipe.mesh = group;
+  pipeGroup.add(group);
+}
+
+// Incremental update: remove old tip, rebuild last 2 segments
+function incrementalUpdate(pipe) {
+  const gp = pipe.gridPoints;
+  const group = pipe.mesh;
+  if (!group || gp.length < 3) {
+    rebuildPipeMesh(pipe);
+    return;
+  }
+
+  // Remove tip hemisphere and the previous last segment's meshes
+  // We need to rebuild the last 2 segments (the previous tip segment may now have a corner)
+  // Simple approach: tag meshes with segment index, remove last 2 segments' meshes
+  // For simplicity, remove the last few children (tip hemi + last cylinder + possible corner)
+  // Safer: just remove everything from the previous-last segment onward
+
+  // Remove old tip hemisphere
+  for (let j = group.children.length - 1; j >= 0; j--) {
+    if (group.children[j]._isTip) {
+      const child = group.children[j];
+      group.remove(child);
+      if (child.geometry && child.geometry !== hemisphereGeom) child.geometry.dispose();
+      break;
+    }
+  }
+
+  // Rebuild the previous segment (may need corner now) and the new segment
+  const prevIdx = gp.length - 3;
+  const newIdx = gp.length - 2;
+
+  // Remove previous segment's cylinder (it may need re-trimming for new corner)
+  // We tag cylinders with _segIdx for this purpose
+  for (let j = group.children.length - 1; j >= 0; j--) {
+    if (group.children[j]._segIdx === prevIdx) {
+      const child = group.children[j];
+      group.remove(child);
+      if (child.geometry && child.geometry !== elbowGeom && child.geometry !== ballGeom && child.geometry !== hemisphereGeom) child.geometry.dispose();
+      j = group.children.length; // reset since we modified array
+    }
+  }
+
+  // Rebuild previous segment and new segment
+  const mat = pipe.material;
+  const prevMeshes = buildSegmentMeshes(gp, prevIdx, mat, group);
+  prevMeshes.forEach(m => m._segIdx = prevIdx);
+  const newMeshes = buildSegmentMeshes(gp, newIdx, mat, group);
+  newMeshes.forEach(m => m._segIdx = newIdx);
+}
+
+function addSegment(pipe) {
+  const pos = pipe.gridPoints[pipe.gridPoints.length - 1];
+  const validDirs = getValidDirections(pos, pipe.dir);
+
+  // Early termination: if pipe is far off-screen, increasing chance to die
+  const offScreen = getOffScreenAmount(pos);
+  if (offScreen > 0.5 && pipe.gridPoints.length > 30) {
+    // The further off-screen, the higher the chance to terminate
+    const deathChance = Math.min(0.3, offScreen * 0.15);
+    if (Math.random() < deathChance) {
+      pipe.alive = false;
+      return;
+    }
+  }
+
+  if (validDirs.length === 0 || pipe.gridPoints.length - 1 >= pipe.maxLength) {
+    pipe.alive = false;
+    return;
+  }
+
+  let newDir = chooseDirection(pipe, validDirs);
+
+  const newPos = pos.clone().add(newDir);
+  markOccupied(newPos);
+  pipe.gridPoints.push(newPos);
+  pipe.dir = newDir;
+  totalSegments++;
+  incrementalUpdate(pipe);
+}
+
+function spawnPipe() {
+  // 2nd+ pipes have 60% chance to spawn near existing pipes
+  const startPos = (pipes.length > 0 && Math.random() < 0.6)
+    ? spawnNearExisting()
+    : randomStartPos();
+  markOccupied(startPos);
+
+  const pipe = {
+    gridPoints: [startPos],
+    dir: null,
+    material: makeMaterial(randomColor()),
+    alive: true,
+    maxLength: MIN_PIPE_LENGTH + Math.floor(Math.random() * (MAX_PIPE_LENGTH - MIN_PIPE_LENGTH)),
+    mesh: null,
+    phase: null, // dynamic phase system
+  };
+  pipes.push(pipe);
+}
+
+// --- Camera (positioned so grid fills the view — some pipes close, most at mid-distance, some far) ---
+function randomizeCamera() {
+  const theta = (Math.random() - 0.5) * 0.15;
+  const phi = (Math.random() - 0.5) * 0.1;
+  camera.position.set(
+    Math.sin(theta) * CAMERA_DIST,
+    Math.sin(phi) * CAMERA_DIST,
+    Math.cos(theta) * Math.cos(phi) * CAMERA_DIST
+  );
+  camera.lookAt(0, 0, 0);
+}
+
+function startDissolve() {
+  dissolving = true;
+  dissolveStart = performance.now();
+}
+
+function finishReset() {
+  scene.remove(pipeGroup);
+  // Dispose all pooled cylinder geometries
+  for (const geom of _cylCache.values()) geom.dispose();
+  _cylCache.clear();
+  // Dispose any per-pipe materials
+  for (const pipe of pipes) {
+    if (pipe.material) pipe.material.dispose();
+  }
+  pipeGroup = new THREE.Group();
+  scene.add(pipeGroup);
+  pipes = [];
+  totalSegments = 0;
+  occupied = new Set();
+  randomizeCamera();
+  // Note: dissolving stays true — the animation loop handles the pause then clears it
+}
+
+function resetScene() {
+  startDissolve();
+}
+
+// --- Animation ---
+let lastGrow = 0;
+let lastFrame = 0;
+const FRAME_INTERVAL = 1000 / 15; // cap at 15fps
+
+function animate(time) {
+  requestAnimationFrame(animate);
+
+  // Cap framerate
+  if (time - lastFrame < FRAME_INTERVAL) return;
+  lastFrame = time;
+
+  // Handle dissolve transition + pause using a CSS overlay for clean fade-to-black
+  if (dissolving) {
+    const elapsed = performance.now() - dissolveStart;
+    if (elapsed < DISSOLVE_DURATION) {
+      // Phase 1: fade to black via overlay
+      const t = elapsed / DISSOLVE_DURATION;
+      fadeOverlay.style.opacity = t;
+    } else if (elapsed < DISSOLVE_DURATION + PAUSE_AFTER_DISSOLVE) {
+      // Phase 2: fully black, clean up on first frame
+      fadeOverlay.style.opacity = 1;
+      if (pipeGroup.children.length > 0) finishReset();
+    } else {
+      // Phase 3: fade back in and start fresh
+      dissolving = false;
+      fadeOverlay.style.opacity = 0;
+      lastGrow = time;
+    }
+    renderer.render(scene, camera);
+    return;
+  }
+
+  // Cache frustum once per frame (used by getOffScreenAmount in grow steps)
+  updateFrustumCache(lastFrame);
+
+  // Grow multiple segments per frame to keep up with speed
+  let steps = 0;
+  while (time - lastGrow >= GROW_INTERVAL && steps < 20) {
+    lastGrow += GROW_INTERVAL;
+    steps++;
+
+    if (totalSegments > MAX_SEGMENTS_TOTAL) {
+      startDissolve();
+      renderer.render(scene, camera);
+      return;
+    }
+
+    // One pipe at a time: only spawn a new one when the current one dies
+    let hasAlive = false;
+    for (const pipe of pipes) {
+      if (pipe.alive) { hasAlive = true; break; }
+    }
+    if (!hasAlive) spawnPipe();
+
+    for (const pipe of pipes) {
+      if (pipe.alive) addSegment(pipe);
+    }
+  }
+  // Prevent lastGrow from falling too far behind
+  if (time - lastGrow > GROW_INTERVAL * 5) lastGrow = time;
+
+  renderer.render(scene, camera);
+}
+
+// --- Events ---
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  // Recalculate grid for new aspect ratio (takes effect on next reset)
+  ({ GRID_W, GRID_H, GRID_D } = calculateGridDimensions());
+  GRID_W_HALF = Math.floor(GRID_W / 2);
+  GRID_H_HALF = Math.floor(GRID_H / 2);
+  GRID_D_HALF = Math.floor(GRID_D / 2);
+});
+
+document.getElementById('resetBtn').addEventListener('click', resetScene);
+
+// --- Start ---
+randomizeCamera();
+spawnPipe();
+requestAnimationFrame(animate);
+
+</script>
+</body>
+</html>
